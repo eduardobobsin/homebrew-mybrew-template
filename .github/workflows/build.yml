@@ -1,0 +1,128 @@
+name: Build bottle
+run-name: Build ${{ inputs.formula }}
+
+# mybrew instance workflow. Storage, runner and verification come from
+# repository variables (Settings → Secrets and variables → Actions → Variables):
+#   MYBREW_S3_BUCKET, MYBREW_AWS_REGION, MYBREW_AWS_ROLE_ARN, MYBREW_ROOT_URL
+#       set by mybrew's scripts/setup-aws.sh; leave unset to store bottles in
+#       this repo's "bottles" GitHub Release instead
+#   MYBREW_RUNNER   JSON runs-on value for builds, default "macos-15-intel";
+#                   e.g. ["self-hosted","macOS","X64"] for your own Intel Mac
+#                   (must run Sequoia: bottles are tagged sequoia)
+#   MYBREW_VERIFY   "false" skips the clean-install check (it needs a
+#                   disposable GitHub-hosted Intel runner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      formula:
+        description: homebrew/core formula to bottle for Intel Sequoia
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tap-writes
+  cancel-in-progress: false
+
+env:
+  ROOT_URL: ${{ vars.MYBREW_ROOT_URL || format('https://github.com/{0}/releases/download/bottles', github.repository) }}
+
+jobs:
+  # Runs untrusted upstream build code, so it gets a read-only token that is
+  # never written to disk.
+  build:
+    runs-on: ${{ fromJSON(vars.MYBREW_RUNNER || '"macos-15-intel"') }}
+    timeout-minutes: 240
+    outputs:
+      formulae: ${{ steps.plan.outputs.formulae }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - id: plan
+        uses: eduardobobsin/mybrew/actions/plan@v0.5.0
+        with:
+          formula: ${{ inputs.formula }}
+
+      - name: Nothing to build
+        if: steps.plan.outputs.formulae == ''
+        env:
+          FORMULA: ${{ inputs.formula }}
+        run: echo "::notice::$FORMULA and its dependencies already have Intel bottles (official or mybrew)."
+
+      - name: Update Homebrew
+        if: steps.plan.outputs.formulae != ''
+        run: brew update
+
+      - if: steps.plan.outputs.formulae != ''
+        uses: eduardobobsin/mybrew/actions/import-formula@v0.5.0
+        with:
+          formulae: ${{ steps.plan.outputs.formulae }}
+
+      - id: build
+        if: steps.plan.outputs.formulae != ''
+        uses: eduardobobsin/mybrew/actions/build-bottle@v0.5.0
+        with:
+          formulae: ${{ steps.plan.outputs.formulae }}
+          root-url: ${{ env.ROOT_URL }}
+
+      - if: steps.plan.outputs.formulae != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottles
+          path: ${{ steps.build.outputs.output-dir }}
+
+  # Only this job can write to the tap or get AWS credentials. It runs no
+  # formula code and trusts nothing in the build artifact beyond bottle
+  # tarballs whose metadata it validates; formulae are rebuilt from
+  # homebrew-core here.
+  publish:
+    needs: build
+    if: needs.build.outputs.formulae != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      install: ${{ steps.s3.outputs.install || steps.release.outputs.install }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bottles
+          path: ${{ runner.temp }}/bottles
+
+      - id: s3
+        if: vars.MYBREW_S3_BUCKET != ''
+        uses: eduardobobsin/mybrew/actions/publish-s3@v0.5.0
+        with:
+          formula: ${{ inputs.formula }}
+          bottle-dir: ${{ runner.temp }}/bottles
+          bucket: ${{ vars.MYBREW_S3_BUCKET }}
+          region: ${{ vars.MYBREW_AWS_REGION }}
+          role-arn: ${{ vars.MYBREW_AWS_ROLE_ARN }}
+          root-url: ${{ env.ROOT_URL }}
+
+      - id: release
+        if: vars.MYBREW_S3_BUCKET == ''
+        uses: eduardobobsin/mybrew/actions/publish-github-release@v0.5.0
+        with:
+          formula: ${{ inputs.formula }}
+          bottle-dir: ${{ runner.temp }}/bottles
+
+  # A clean machine must install everything from the published tap without
+  # compiling anything. Uninstalls conflicting formulae, so it must only ever
+  # run on a disposable GitHub-hosted runner.
+  verify:
+    needs: publish
+    if: vars.MYBREW_VERIFY != 'false'
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: eduardobobsin/mybrew/actions/verify-install@v0.5.0
+        with:
+          formulae: ${{ needs.publish.outputs.install }}
